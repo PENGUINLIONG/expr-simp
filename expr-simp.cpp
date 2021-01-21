@@ -314,27 +314,6 @@ void simplify_prioritize_mul_coefficients(std::unique_ptr<Ast>& ast) {
   }
 }
 
-// Distribute constants operations to sub-6expressions.
-// DO NOT USE because integral ops CANNOT propagate.
-void simplify_distribute_constants(std::unique_ptr<Ast>& ast) {
-  if (ast->is_node()) {
-    if (ast->is_associative_node()) {
-      if (ast->left->is_combinational_node() && ast->right->is_constant()) {
-        auto left = Ast::make_node(ast->op, std::move(ast->left->left), Ast::make_constant(ast->right->constant));
-        auto right = Ast::make_node(ast->op, std::move(ast->left->right), Ast::make_constant(ast->right->constant));
-        ast = Ast::make_node(ast->left->op, std::move(left), std::move(right));
-      }
-      if (ast->right->is_combinational_node() && ast->left->is_constant()) {
-        auto left = Ast::make_node(ast->op, std::move(ast->right->left), Ast::make_constant(ast->left->constant));
-        auto right = Ast::make_node(ast->op, std::move(ast->right->right), Ast::make_constant(ast->left->constant));
-        ast = Ast::make_node(ast->right->op, std::move(left), std::move(right));
-      }
-    }
-    simplify_distribute_constants(ast->left);
-    simplify_distribute_constants(ast->right);
-  }
-}
-
 // Fold multiplications.
 //
 // Depends on `simplify_prioritize_mul_coefficients`.
@@ -397,6 +376,19 @@ void simplify_associate_div(std::unique_ptr<Ast>& ast) {
 // Fold modulos. The divisors are always on the right.
 //
 // Depends on `simplify_prioritize_mul_coefficients`.
+void simplify_associate_mod_remove_nop(std::unique_ptr<Ast>& ast, int operand) {
+  if (ast->is_node()) {
+    simplify_associate_mod_remove_nop(ast->left, operand);
+    simplify_associate_mod_remove_nop(ast->right, operand);
+
+    // Complicated cases.
+    if (ast->is_node('*') && ast->left->is_constant()) {
+      if (ast->left->constant % operand == 0) {
+        ast = Ast::make_constant(0);
+      }
+    }
+  }
+}
 void simplify_associate_mod(std::unique_ptr<Ast>& ast) {
   if (ast->is_node()) {
     simplify_associate_mod(ast->left);
@@ -416,12 +408,7 @@ void simplify_associate_mod(std::unique_ptr<Ast>& ast) {
       // multiple of the divisor; and in that case the expression always gives a
       // zero. `simplify_prioritize_mul_coefficients` ensures that all constant
       // multiplicants are on the left.
-      if (
-        ast->left->is_node('*') && ast->left->left->is_constant() &&
-        ast->left->left->constant % ast->right->constant == 0
-      ) {
-        ast = Ast::make_constant(0);
-      }
+      simplify_associate_mod_remove_nop(ast->left, ast->right->constant);
     }
   }
 }
@@ -464,42 +451,13 @@ void simplify_remove_nop(std::unique_ptr<Ast>& ast) {
   }
 }
 
-// Extract common operations to higher leve.
-// DO NOT USE because integer operations doesn't propagate.
-void simplify_extract_common_ops(std::unique_ptr<Ast>& ast) {
-  if (ast->is_node()) {
-    simplify_extract_common_ops(ast->left);
-    simplify_extract_common_ops(ast->right);
-
-    if (ast->left->is_node() && ast->right->is_node() && ast->left->op == ast->right->op) {
-      if (
-        ast->left->left->is_constant() && ast->right->left->is_constant() &&
-        ast->left->left->constant == ast->right->left->constant
-        ) {
-        auto right = Ast::make_node(ast->op, std::move(ast->left->right), std::move(ast->right->right));
-        ast = Ast::make_node(ast->left->op, std::move(ast->left->left), std::move(right));
-      }
-      if (
-        ast->left->right->is_constant() && ast->right->right->is_constant() &&
-        ast->left->right->constant == ast->right->right->constant
-      ) {
-        auto left = Ast::make_node(ast->op, std::move(ast->right->left), std::move(ast->left->left));
-        ast = Ast::make_node(ast->right->op, std::move(left), std::move(ast->right->right));
-      }
-    }
-  }
-}
-
-
 void simplify(std::unique_ptr<Ast>& ast) {
   // DON'T CHANGE THE ORDER HERE.
   simplify_prioritize_mul_coefficients(ast);
-  simplify_distribute_constants(ast);
   simplify_associate_mul(ast);
   simplify_associate_div(ast);
   simplify_associate_mod(ast);
   simplify_remove_nop(ast);
-  simplify_extract_common_ops(ast);
 }
 
 
@@ -514,4 +472,5 @@ int main(int argc, const char** argv) {
   simplify(ast);
   std::cout << "input: " << expr_lit << std::endl;
   std::cout << "ouptut: " << print(ast) << std::endl;
+  std::cout << std::endl;
 }
