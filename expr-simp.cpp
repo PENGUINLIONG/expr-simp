@@ -36,7 +36,7 @@ std::vector<Token> lex(const char* expr) {
     const char c = *pos;
 
     bool is_digit = c >= '0' && c <= '9';
-    bool is_alphabet = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+    bool is_alphabet = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c == '_');
     bool is_whitespace = c == ' ' || c == '\t';
 
     TokenType ty;
@@ -114,6 +114,7 @@ class Tokenizer {
   size_t i_;
 
 public:
+  // TODO: (penguinliong) Better error handling?
   Tokenizer(const std::string& lit) : tokens_(lex(lit.c_str())), i_() {
   }
 
@@ -154,8 +155,15 @@ enum AstNodeType {
 
 struct Ast {
   AstNodeType node_ty;
+
+  // L_AST_CONSTANT
   int constant;
+  int range_hint_high;
+
+  // L_AST_SYMBOL
   std::string symbol;
+
+  // L_AST_SUBNODE
   char op;
   std::unique_ptr<Ast> left;
   std::unique_ptr<Ast> right;
@@ -170,6 +178,7 @@ struct Ast {
     auto ast = std::make_unique<Ast>();
     ast->node_ty = L_AST_SYMBOL;
     ast->symbol = symbol;
+    ast->range_hint_high = 0;
     return ast;
   }
   static std::unique_ptr<Ast> make_node(
@@ -295,6 +304,18 @@ std::string print(const std::unique_ptr<Ast>& ast) {
 
 
 
+void hint_symbol(std::unique_ptr<Ast>& ast, const std::string& symbol, int high) {
+  if (ast->is_symbol() && ast->symbol == symbol) {
+    ast->range_hint_high = high;
+  }
+  if (ast->is_node()) {
+    hint_symbol(ast->left, symbol, high);
+    hint_symbol(ast->right, symbol, high);
+  }
+}
+
+
+
 
 
 
@@ -312,6 +333,97 @@ void simplify_prioritize_mul_coefficients(std::unique_ptr<Ast>& ast) {
       }
     }
   }
+}
+
+// Depends on `simplify_prioritize_mul_coefficients`.
+bool simplify_is_multiple_of(std::unique_ptr<Ast>& ast, int divisor) {
+  if (ast->is_symbol()) {
+    return false;
+  }
+  if (ast->is_constant()) {
+    return ast->constant % divisor == 0;
+  }
+  if (ast->is_node('*')) {
+    return simplify_is_multiple_of(ast->left, divisor);
+  }
+  if (ast->is_combinational_node()) {
+    return simplify_is_multiple_of(ast->left, divisor) &&
+      simplify_is_multiple_of(ast->right, divisor);
+  }
+  return false;
+}
+
+// Get all coefficients in a polynomial. The function returns no element if the
+// sub-expression contains any division or modulo.
+bool simplify_collect_coefficients_impl(std::unique_ptr<Ast>& ast, std::vector<int>& out) {
+  if (ast->is_symbol()) {
+    out.push_back(1);
+    return true;
+  }
+  if (ast->is_constant()) {
+    out.push_back(ast->constant);
+    return true;
+  }
+  if (ast->is_node('*')) {
+    return simplify_collect_coefficients_impl(ast->left, out);
+  }
+  if (ast->is_combinational_node()) {
+    return simplify_collect_coefficients_impl(ast->left, out) &&
+      simplify_collect_coefficients_impl(ast->right, out);
+  }
+  return false;
+}
+std::vector<int> simplify_collect_coefficients(std::unique_ptr<Ast>& ast) {
+  std::vector<int> out;
+  return simplify_collect_coefficients_impl(ast, out) ? out : std::vector<int> {};
+}
+int simplify_get_coefficient_gcd(std::unique_ptr<Ast>& ast) {
+  auto gcd = [](int a, int b) {
+    while (a != b) {
+      if (a > b) {
+        a -= b;
+      } else {
+        b -= a;
+      }
+    }
+    return a;
+  };
+  auto coes = simplify_collect_coefficients(ast);
+  if (coes.empty()) { return 1; }
+
+  auto out = coes[0];
+  for (auto coe : coes) {
+    out = gcd(coe, out);
+  }
+  return out;
+}
+
+// Get the upper bound of the values in this sub-expression. Retuens 0 if one
+// term has never been hinted.
+int simplify_upper_bound_of(const std::unique_ptr<Ast>& ast) {
+  if (ast->is_constant()) {
+    return ast->constant;
+  }
+  if (ast->is_symbol()) {
+    // Can be zero, and we let it contaminate the other numbers to give a zero
+    // result.
+    return ast->range_hint_high;
+  }
+  if (ast->is_node('*')) {
+    return simplify_upper_bound_of(ast->left) *
+      simplify_upper_bound_of(ast->right);
+  }
+  if (ast->is_node('%')) {
+    return simplify_upper_bound_of(ast->right);
+  }
+  if (ast->is_node('/')) {
+    auto divisor = simplify_upper_bound_of(ast->right);
+    return (simplify_upper_bound_of(ast->left) + divisor - 1) / divisor;
+  }
+  if (ast->is_node('+')) {
+    return simplify_upper_bound_of(ast->left) + simplify_upper_bound_of(ast->right);
+  }
+  throw std::logic_error("not implemented yet");
 }
 
 // Fold multiplications.
@@ -344,6 +456,19 @@ void simplify_associate_mul(std::unique_ptr<Ast>& ast) {
 // Fold divisions. The divisors are always on the right.
 //
 // Depends on `simplify_prioritize_mul_coefficients`.
+void simplify_associate_div_remove_nop(std::unique_ptr<Ast>& ast, int operand) {
+  if (ast->is_node()) {
+    simplify_associate_div_remove_nop(ast->left, operand);
+    simplify_associate_div_remove_nop(ast->right, operand);
+
+    // Complicated cases.
+    if (ast->is_node('*') && ast->left->is_constant()) {
+      if (ast->left->constant % operand == 0) {
+        ast->left->constant /= operand;
+      }
+    }
+  }
+}
 void simplify_associate_div(std::unique_ptr<Ast>& ast) {
   if (ast->is_node()) {
     simplify_associate_div(ast->left);
@@ -362,12 +487,22 @@ void simplify_associate_div(std::unique_ptr<Ast>& ast) {
       // Fold multiply-divide patterns. Only do this when the multiplicant is a
       // multiple of the divisor. `simplify_prioritize_mul_coefficients` ensures
       // that all constant multiplicants are on the left.
-      if (
-        ast->left->is_node('*') && ast->left->left->is_constant() &&
-        ast->left->left->constant % ast->right->constant == 0
-      ) {
-        ast->left->left->constant /= ast->right->constant;
+      if (simplify_is_multiple_of(ast->left, ast->right->constant)) {
+        simplify_associate_div_remove_nop(ast->left, ast->right->constant);
         ast = std::move(ast->left);
+      }
+      // THE FOLLOWING SECTION MUST PRECEDE THE ONE ABOVE; OTHERWISE THE STACK
+      // WOULD OVERFLOW.
+      // In case the left-expression share a common divisor, we can extract the
+      // common divisor to the right-constant. In some cases, the common divisor
+      // can be a coefficient in some terms in the left-expression. So some
+      // multiplication can be saved.
+      auto gcd = simplify_get_coefficient_gcd(ast->left);
+      if (gcd != 1 && simplify_is_multiple_of(ast->right, gcd)) {
+        ast->right->constant /= gcd;
+        auto left = Ast::make_node('/', std::move(ast->left), Ast::make_constant(gcd));
+        simplify_associate_div(left);
+        ast->left = std::move(left);
       }
     }
   }
@@ -409,6 +544,12 @@ void simplify_associate_mod(std::unique_ptr<Ast>& ast) {
       // zero. `simplify_prioritize_mul_coefficients` ensures that all constant
       // multiplicants are on the left.
       simplify_associate_mod_remove_nop(ast->left, ast->right->constant);
+      // If the upper bound is hinted never reaching the modulo divisor, the
+      // modulo can be removed.
+      auto upper_bound = simplify_upper_bound_of(ast->left);
+      if (upper_bound > 0 && upper_bound <= ast->right->constant) {
+        ast = std::move(ast->left);
+      }
     }
   }
 }
@@ -463,12 +604,13 @@ void simplify(std::unique_ptr<Ast>& ast) {
 
 
 
-
 int main(int argc, const char** argv) {
-  const char* expr_lit = "(a*8+b*4+c*2+d)%4";
+  const char* expr_lit = "(((((((group_id2)*1048576)+((local_id2)*16384))+((group_id1)*1024))+((local_id1)*512))+((group_id0)*32))+((local_id0)*8))/4%64";
 
   Tokenizer tokenizer(expr_lit);
   auto ast = parse_expr(tokenizer);
+  hint_symbol(ast, "global_id0", 2);
+  hint_symbol(ast, "local_id0", 2);
   simplify(ast);
   std::cout << "input: " << expr_lit << std::endl;
   std::cout << "ouptut: " << print(ast) << std::endl;
